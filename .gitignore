@@ -1,0 +1,102 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual Environments
+# =========================
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+log/
+
+# =========================
+# Bytecode / Cache
+# =========================
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.cache/
+
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# =========================
+# Coverage / Test
+# =========================
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# =========================
+# Jupyter / IPython
+# =========================
+.ipynb_checkpoints/
+.profile_default/
+.ipython/
+
+# =========================
+# FastAPI / Uvicorn
+# =========================
+uvicorn.log
+gunicorn.log
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# JetBrains
+.idea/
+
+# =========================
+# Runtime / Temp
+# =========================
+*.pid
+*.sock
+tmp/
+temp/
+
+# =========================
+# SQLite / Local DB
+# =========================
+*.sqlite
+*.sqlite3
+db.sqlite3
+
+# =========================
+# Docker (optional)
+# =========================
+docker-data/

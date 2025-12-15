@@ -1,0 +1,84 @@
+from fastapi import APIRouter, Query
+import ccxt.async_support as ccxt_async  # ← 异步版
+import asyncio
+
+router = APIRouter()
+
+
+@router.get("/summary")
+async def get_pair_summary(
+    exchange: str = Query(
+        "binance",
+        description="交易所名称（小写），如 binance, okx, bybit, gate, kraken",
+        example="binance",
+    ),
+    symbol: str = Query(
+        "BTC/USDT",
+        description="交易对（CCXT 标准格式，大写带斜杠），如 BTC/USDT, ETH/USDT",
+        example="BTC/USDT",
+    ),
+):
+    """
+    异步版本的 /summary 接口，完全兼容旧 CryptoWatch 结构
+    使用 ccxt.async_support，避免阻塞事件循环
+    """
+    exchange = exchange.lower().strip()
+    symbol = symbol.upper().strip()
+
+    ex: ccxt_async.Exchange | None = None
+    try:
+        ex_class = getattr(ccxt_async, exchange, None)
+        if not ex_class:
+            return {"error": f"不支持的交易所: '{exchange}'"}
+
+        ex = ex_class()
+
+        # 异步加载市场数据（关键！避免 symbol 映射错误）
+        await ex.load_markets()
+
+        if symbol not in ex.markets:
+            return {"error": f"无效的交易对: '{symbol}' 在 {exchange} 不存在或未激活"}
+
+        market = ex.markets[symbol]
+        standardized_symbol = market["symbol"]
+
+        # 异步获取 ticker
+        ticker = await ex.fetch_ticker(standardized_symbol)
+
+        # 可选：校验返回的 symbol 是否匹配（防御性编程）
+        returned_symbol = ticker.get("symbol")
+        if returned_symbol and returned_symbol != standardized_symbol:
+            print(
+                f"[WARNING] {exchange} ticker symbol 不匹配: "
+                f"请求 {standardized_symbol}, 返回 {returned_symbol}"
+            )
+
+        result = {
+            "symbol": standardized_symbol,
+            "price": {
+                "last": ticker.get("last"),
+                "high": ticker.get("high"),
+                "low": ticker.get("low"),
+                "change": {
+                    "percentage": ticker.get("percentage"),
+                    "absolute": ticker.get("change"),
+                },
+            },
+            "volume": ticker.get("baseVolume") or ticker.get("volume") or 0.0,
+            "volumeQuote": ticker.get("quoteVolume") or 0.0,
+            "timestamp": ticker.get("timestamp")
+            or int(asyncio.get_event_loop().time() * 1000),
+        }
+
+        return {"result": result}
+
+    except ccxt_async.BadSymbol:
+        return {"error": f"无效的交易对: '{symbol}' 在 {exchange} 不存在"}
+    except ccxt_async.ExchangeError as e:
+        return {"error": f"交易所错误: {str(e)}"}
+    except Exception as e:
+        return {"error": f"未知错误: {str(e)}"}
+    finally:
+        # 【重要】异步版本必须关闭连接，防止连接泄漏
+        if ex is not None:
+            await ex.close()
