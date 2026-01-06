@@ -94,24 +94,6 @@ https://github.com/aipinn/dcex.git
 
 ---
 
-Project Structure (Simplified)
-
-.
-├── main.py
-├── routers
-│   ├── ticker.py
-│   ├── order_book.py
-│   └── websocket.py
-├── services
-│   ├── ccxt_service.py
-│   └── ws_manager.py
-├── core
-│   ├── config.py
-│   └── logging.py
-└── README.md
-
----
-
 Disclaimer
 
 This project is for educational and research purposes only.
