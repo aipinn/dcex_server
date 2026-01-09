@@ -13,6 +13,7 @@ from routers import order_book
 from routers import trades
 from routers import ws_ticker
 from utils.logger import setup_logging
+from routers.contracts import contract
 
 setup_logging()
 
@@ -48,6 +49,9 @@ app.include_router(ohlc.router, prefix="/api")
 app.include_router(order_book.router, prefix="/api")
 
 app.include_router(trades.router, prefix="/api")
+
+# 注册合约路由
+app.include_router(contract.router, prefix="/api") 
 
 # app.include_router(ws_ticker.router, prefix="")
 

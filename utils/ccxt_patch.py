@@ -40,6 +40,8 @@ def apply_global_ccxt_patch():
             # 1. 基础公共配置
             config.setdefault("enableRateLimit", True)
 
+            config.setdefault("timeout", 60000)
+
             # 2. 根据模式注入互斥的代理参数
             if mode == "sync":
                 # 同步版 ccxt 使用原生的 proxies 结构
