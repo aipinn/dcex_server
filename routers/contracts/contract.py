@@ -104,100 +104,88 @@ def get_contracts_markets(
 
 # ==========================================
 # ==========================================
+# routers/contracts.py（完全动态版，支持 109 个 ccxt.pro 交易所）
 
-# 热门U本位永续合约（不同交易所symbol格式不同）
-EXCHANGE_SYMBOLS = {
-    "bybit": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
-    "okx": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"],
-    "bingx": ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT"],
-    "bitget": ["0G/USDT:USDT"],
+# 保底主流 U 本位永续合约（客户端不传 symbols 时使用）
+DEFAULT_SYMBOLS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"
+]
+
+# 少数需要特殊 load_markets 参数的交易所（其他默认就行）
+SPECIAL_LOAD_PARAMS = {
+    "bybit": {"category": "linear"},
+    "okx": {"instType": "SWAP"},
+    "bingx": {"category": "perpetual"},
+    "bitget": {},
+    "gate": {"type": "swap"},
+    "mexc": {"type": "swap"},
 }
 
-# 创建实例的工厂函数
-def create_pro_exchange(name: str) -> ccxt_pro.Exchange:
-    if name == "bybit":
-        return ccxt_pro.bybit({"options": {"defaultType": "swap"}})
-    elif name == "okx":
-        return ccxt_pro.okx()
-    elif name == "bingx":
-        return ccxt_pro.bingx({"options": {"defaultType": "swap"}})
-    elif name == "bitget":
-        return ccxt_pro.bitget({"options": {"defaultType": "swap"}})
-    else:
-        raise ValueError(f"不支持的交易所: {name}")
-
 @router.websocket("/ws/contracts")
-async def ws_multi_contracts(
+async def ws_dynamic_contracts(
     websocket: WebSocket,
-    exchange: str = Query("bybit", description="bybit | okx | bingx | bitget | all")
+    exchange: str = Query(..., description="任意 ccxt.pro 支持的小写交易所名，如 bybit、okx、gate、mexc..."),
+    symbols: str = Query(None, description="可选，逗号分隔的 symbol 列表，如 BTCUSDT,ETHUSDT（不传用保底）")
 ):
     await websocket.accept()
     alive = asyncio.Event()
     alive.set()
-    logger.info(f"多交易所WS连接成功，指定: {exchange}")
+    logger.info(f"WS 连接成功，交易所: {exchange}")
 
-    # 支持all = 所有交易所
-    if exchange == "all":
-        target_exchanges = list(EXCHANGE_SYMBOLS.keys())
-    elif exchange in EXCHANGE_SYMBOLS:
-        target_exchanges = [exchange]
-    else:
-        await websocket.send_json({"error": "不支持的交易所"})
+    # 动态创建 ccxt.pro 实例（支持全部 109 个）
+    try:
+        config = {
+            "options": {"defaultType": "swap"},  # 默认 U 本位永续
+            "enableRateLimit": True,
+        }
+        exchange_class = getattr(ccxt_pro, exchange)
+        ex = exchange_class(config)
+    except AttributeError:
+        await websocket.send_json({"error": f"ccxt.pro 不支持该交易所: {exchange}（请检查拼写，小写）"})
+        await websocket.close(code=1000)
+        return
+    except Exception as e:
+        await websocket.send_json({"error": f"创建实例失败: {str(e)}"})
         await websocket.close(code=1000)
         return
 
-    pro_instances: Dict[str, ccxt_pro.Exchange] = {}
     tasks = []
-
     try:
-        # 为每个交易所创建独立实例
-        for ex_name in target_exchanges:
-            ex = create_pro_exchange(ex_name)
-            pro_instances[ex_name] = ex
+        # 尝试加载市场（特殊交易所用 params）
+        try:
+            params = SPECIAL_LOAD_PARAMS.get(exchange, {})
+            await ex.load_markets(params=params)
+            logger.info(f"{exchange} markets 加载成功")
+        except Exception as e:
+            logger.warning(f"{exchange} markets 加载失败: {e}")
 
-            # 尝试加载市场（失败用保底symbol）
-            loaded = False
-            try:
-                if ex_name == "bybit":
-                    await ex.load_markets(params={"category": "linear"})
-                elif ex_name == "okx":
-                    await ex.load_markets(params={"instType": "SWAP"})
-                elif ex_name == "bingx":
-                    await ex.load_markets(params={"category": "perpetual"})
-                elif ex_name == "bitget":
-                    await ex.load_markets()
-                loaded = True
-                logger.info(f"{ex_name} markets加载成功")
-            except Exception as e:
-                logger.warning(f"{ex_name} markets加载失败: {e}")
+        # symbol 来源：客户端传 > 保底
+        if symbols:
+            target_symbols = [s.strip() for s in symbols.split(",")][:10]  # 最多 10 个，防滥用
+        else:
+            target_symbols = DEFAULT_SYMBOLS[:5]
 
-            symbols = EXCHANGE_SYMBOLS[ex_name][:5]  # 每家取5个
-            logger.info(f"{ex_name} 开始推送 {len(symbols)} 个合约: {symbols}")
+        logger.info(f"{exchange} 开始推送 {len(target_symbols)} 个合约: {target_symbols}")
 
-            for symbol in symbols:
-                tasks.append(asyncio.create_task(ticker_task(ex, symbol, websocket, ex_name, alive)))
-
-        while True:
-            await websocket.receive_text()
-
-    except WebSocketDisconnect:
-        logger.info("WS客户端正常断开")
-    except Exception as e:
-        logger.error(f"WS异常: {e}")
-    finally:
-        alive.clear()
-
-        for task in tasks:
-            task.cancel()
+        for symbol in target_symbols:
+            tasks.append(asyncio.create_task(ticker_task(ex, symbol, websocket, exchange, alive)))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        for ex in pro_instances.values():
-            await ex.close()
+    except WebSocketDisconnect:
+        logger.info("WS 客户端正常断开")
+    except Exception as e:
+        logger.error(f"WS 异常: {e}")
+    finally:
+        alive.clear()
+        await asyncio.sleep(0.1)  # 给任务响应取消
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await ex.close()
+        logger.info("WS 资源已清理")
 
-        logger.info("WS资源已清理")
-
-# 通用ticker任务（手动提取字段，避免解析bug）
+# ticker 任务（手动提取字段 + 关闭检测 + 无效价格过滤）
 async def ticker_task(
     ex: ccxt_pro.Exchange,
     symbol: str,
@@ -205,32 +193,33 @@ async def ticker_task(
     ex_name: str,
     alive: asyncio.Event,
 ):
-    try:
-        while alive.is_set():
+    while alive.is_set():
+        try:
             ticker = await ex.watch_ticker(symbol)
 
-            # WS 已断开或进入关闭态，立即退出
+            # 检测 WS 是否已关闭
             if not alive.is_set() or ws.client_state.name != "CONNECTED":
+                logger.debug(f"{ex_name} {symbol} WS 已关闭，停止 ticker 任务")
                 break
 
-            try:
-                await ws.send_json({
-                    "type": "ticker",
-                    "exchange": ex_name,
-                    "symbol": symbol,
-                    "last": ticker.get("last"),
-                    "timestamp": ticker.get("timestamp"),
-                })
-            except RuntimeError as e:
-                # send on closed websocket
-                logger.info(f"{ex_name} {symbol} WS已关闭，停止ticker任务")
-                break
+            data = {
+                "type": "ticker",
+                "exchange": ex_name,
+                "symbol": symbol,
+                "last": ticker.get("last") or ticker.get("lastPrice") or ticker.get("lastPx"),
+                "change": ticker.get("percentage") or ticker.get("price24hPcnt") or ticker.get("priceChangePercent"),
+                "volume_24h": ticker.get("baseVolume") or ticker.get("volume24h"),
+                "timestamp": ticker.get("timestamp") or ticker.get("ts"),
+            }
 
-    except asyncio.CancelledError:
-        # 正常取消
-        pass
-    except WebSocketDisconnect:
-        # 客户端断开
-        logger.info(f"{ex_name} {symbol} WS断开，ticker任务结束")
-    except Exception as e:
-        logger.warning(f"{ex_name} {symbol} ticker异常: {e}")
+            # 过滤无效价格，不发垃圾数据
+            if data["last"] is None or data["last"] <= 0:
+                logger.warning(f"{ex_name} {symbol} 无效价格，跳过发送")
+                await asyncio.sleep(5)
+                continue
+
+            await ws.send_json(data)
+
+        except Exception as e:
+            logger.warning(f"{ex_name} {symbol} ticker 异常: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
