@@ -107,8 +107,8 @@ def get_contracts_markets(
 
 # 热门U本位永续合约（不同交易所symbol格式不同）
 EXCHANGE_SYMBOLS = {
-    # "bybit": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
-    # "okx": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"],
+    "bybit": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
+    "okx": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"],
     "bingx": ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT"],
     "bitget": ["0G/USDT:USDT"],
 }
@@ -132,6 +132,8 @@ async def ws_multi_contracts(
     exchange: str = Query("bybit", description="bybit | okx | bingx | bitget | all")
 ):
     await websocket.accept()
+    alive = asyncio.Event()
+    alive.set()
     logger.info(f"多交易所WS连接成功，指定: {exchange}")
 
     # 支持all = 所有交易所
@@ -173,37 +175,62 @@ async def ws_multi_contracts(
             logger.info(f"{ex_name} 开始推送 {len(symbols)} 个合约: {symbols}")
 
             for symbol in symbols:
-                tasks.append(asyncio.create_task(ticker_task(ex, symbol, websocket, ex_name)))
+                tasks.append(asyncio.create_task(ticker_task(ex, symbol, websocket, ex_name, alive)))
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            await websocket.receive_text()
 
     except WebSocketDisconnect:
         logger.info("WS客户端正常断开")
     except Exception as e:
         logger.error(f"WS异常: {e}")
     finally:
+        alive.clear()
+
         for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.sleep(0.1)  # 给任务100ms时间响应取消
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
         for ex in pro_instances.values():
             await ex.close()
 
+        logger.info("WS资源已清理")
+
 # 通用ticker任务（手动提取字段，避免解析bug）
-async def ticker_task(ex: ccxt_pro.Exchange, symbol: str, ws: WebSocket, ex_name: str):
-    while True:
-        try:
+async def ticker_task(
+    ex: ccxt_pro.Exchange,
+    symbol: str,
+    ws: WebSocket,
+    ex_name: str,
+    alive: asyncio.Event,
+):
+    try:
+        while alive.is_set():
             ticker = await ex.watch_ticker(symbol)
-            data = {
-                "type": "ticker",
-                "exchange": ex_name,
-                "symbol": symbol,
-                "last": ticker.get("last") or ticker.get("lastPrice") or ticker.get("lastPx"),
-                "change": ticker.get("percentage") or ticker.get("price24hPcnt") or ticker.get("priceChangePercent"),
-                "volume_24h": ticker.get("baseVolume") or ticker.get("volume24h"),
-                "timestamp": ticker.get("timestamp") or ticker.get("ts"),
-            }
-            await ws.send_json(data)
-        except Exception as e:
-            logger.warning(f"{ex_name} {symbol} ticker错误: {type(e).__name__}: {e}")
-            await asyncio.sleep(5)
+
+            # WS 已断开或进入关闭态，立即退出
+            if not alive.is_set() or ws.client_state.name != "CONNECTED":
+                break
+
+            try:
+                await ws.send_json({
+                    "type": "ticker",
+                    "exchange": ex_name,
+                    "symbol": symbol,
+                    "last": ticker.get("last"),
+                    "timestamp": ticker.get("timestamp"),
+                })
+            except RuntimeError as e:
+                # send on closed websocket
+                logger.info(f"{ex_name} {symbol} WS已关闭，停止ticker任务")
+                break
+
+    except asyncio.CancelledError:
+        # 正常取消
+        pass
+    except WebSocketDisconnect:
+        # 客户端断开
+        logger.info(f"{ex_name} {symbol} WS断开，ticker任务结束")
+    except Exception as e:
+        logger.warning(f"{ex_name} {symbol} ticker异常: {e}")
