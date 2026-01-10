@@ -220,6 +220,32 @@ async def ticker_task(
 
             await ws.send_json(data)
 
+        except ccxt.BadSymbol as e:
+            # ❌ 不支持的 symbol —— 不可恢复
+            logger.warning(f"{ex_name} {symbol} 不存在: {e}")
+
+            # 通知 client（只发一次）
+            if ws.client_state.name == "CONNECTED":
+                await ws.send_json({
+                    "type": "error",
+                    "exchange": ex_name,
+                    "symbol": symbol,
+                    "reason": "symbol_not_supported",
+                })
+
+            break  # ⭐ 关键：直接结束这个 symbol 的 task
+
+        except WebSocketDisconnect:
+            # 客户端主动断开
+            logger.info(f"{ex_name} {symbol} WS 客户端断开")
+            break
+
+        except RuntimeError as e:
+            # WS 已 close 再 send 会进这里
+            logger.info(f"{ex_name} {symbol} WS 已关闭: {e}")
+            break
+
         except Exception as e:
-            logger.warning(f"{ex_name} {symbol} ticker 异常: {type(e).__name__}: {e}")
+            # ✅ 网络抖动、临时错误，允许 retry
+            logger.warning(f"{ex_name} {symbol} ticker 临时异常: {type(e).__name__}: {e}")
             await asyncio.sleep(5)
