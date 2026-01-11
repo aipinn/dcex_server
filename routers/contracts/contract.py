@@ -1,10 +1,8 @@
 # routers/contracts.py
-import ccxt.async_support as ccxt_async  # 使用异步版支持WebSocket高效推送
 import ccxt  # 同步版，直接受益于你的全局apply_global_ccxt_patch()
-import ccxt.pro as ccxt_pro 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from fastapi import Query, HTTPException
-from typing import List, Dict, Optional
+import ccxt.pro as ccxt_pro
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException
+from typing import Dict, List, Optional
 import asyncio
 import logging
 
@@ -16,19 +14,18 @@ SYNC_INSTANCE_CACHE: Dict[str, ccxt.Exchange] = {}
 
 def get_sync_exchange_instance(
     exchange_name: str = "okx",
-    contract_type: str = "linear"
+    contract_type: str = "linear"  # 新增支持：linear (U本位) | inverse (币本位)
 ) -> ccxt.Exchange:
     """
     支持客户端任意传入交易所名称（小写），自动创建ccxt实例
     客户端示例：?exchange=bybit&type=linear
-              ?exchange=gate&type=linear
-              ?exchange=mexc&type=linear
+              ?exchange=gate&type=inverse
     """
     key = f"{exchange_name}_{contract_type}"
     if key in SYNC_INSTANCE_CACHE:
         return SYNC_INSTANCE_CACHE[key]
 
-    config = {}  # 依赖全局补丁注入代理/timeout/rateLimit
+    config = {}  # 故意为空，依赖全局补丁注入代理/timeout/limit
 
     # 特殊处理需要自定义urls或options的交易所
     if exchange_name == "binance":
@@ -41,16 +38,16 @@ def get_sync_exchange_instance(
         }
         config["options"] = {"defaultType": "future" if contract_type == "linear" else "delivery"}
 
-    elif exchange_name in ["bybit", "bitget"]:  # 注意拼写：bigget → bitget
-        config["options"] = {"defaultType": "swap"}
+    elif exchange_name in ["bybit", "bitget"]:
+        config["options"] = {"defaultType": "swap" if contract_type == "linear" else "inverse"}
 
     elif exchange_name in ["okx", "gate", "mexc", "kucoin", "huobi", "htx"]:
-        # 大多数亚洲CEX默认就是swap/linear，无需额外配置
-        config["options"] = {"defaultType": "swap"}
+        # 大多数亚洲CEX默认就是swap/linear/inverse，无需额外配置
+        config["options"] = {"defaultType": "swap" if contract_type == "linear" else "inverse"}
 
     else:
         # 其他交易所直接用默认配置（ccxt会自动处理）
-        pass
+        config["options"] = {"defaultType": "swap" if contract_type == "linear" else "inverse"}
 
     # 动态创建实例（ccxt支持字符串作为类名）
     try:
@@ -62,17 +59,30 @@ def get_sync_exchange_instance(
     SYNC_INSTANCE_CACHE[key] = ex
     return ex
 
+
+# 某些交易所 load_markets 需要额外参数，否则 WS 会歧义 / 报错
+SPECIAL_LOAD_PARAMS = {
+    # OKX：必须指定 marketType，否则 BTC-USDT-SWAP 会歧义
+    "okx": {
+        "type": "swap",
+    },
+
+    # 如果以后发现其他交易所有类似问题，再加
+    # "bybit": {...},
+    # "gate": {...},
+}
+
 @router.get("/contracts/markets")
 def get_contracts_markets(
-    exchange: str = Query("binance", description="交易所: binance | okx | bybit"),
-    type: str = Query("linear", description="合约类型: linear (U本位) | inverse (币本位)")
+    exchange: str = Query("binance", description="交易所: binance | okx | bybit | gate | mexc..."),
+    type: str = Query("linear", description="linear (U本位) | inverse (币本位)")
 ):
     """
     客户端可传参数控制返回哪家交易所的哪类合约
     示例：
-    /api/contracts/markets?exchange=binance&type=linear   → Binance U本位
-    /api/contracts/markets?exchange=binance&type=inverse  → Binance 币本位
-    /api/contracts/markets?exchange=okx&type=linear       → OKX U本位（OKX无币本位区分）
+    /api/contracts/markets?exchange=binance&type=linear → Binance U本位
+    /api/contracts/markets?exchange=binance&type=inverse → Binance 币本位
+    /api/contracts/markets?exchange=okx&type=linear → OKX U本位
     """
     ex = get_sync_exchange_instance(exchange, type)
     try:
@@ -90,58 +100,54 @@ def get_contracts_markets(
             }
             for m in contracts
         ]
+        # 客户端指定类型过滤（保持你原有逻辑）
         if type == "linear":
             result = [r for r in result if r["linear"]]
         elif type == "inverse":
             result = [r for r in result if r["inverse"]]
 
         result.sort(key=lambda x: x["symbol"])
-        return result
+        logger.info(f"返回 {exchange} {type} 合约 {len(result)} 个")
+        return {"data": result}
     except Exception as e:
         logger.error(f"加载 {exchange} {type} 合约失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
 
 # ==========================================
+# WS 部分：支持客户端传 type 区分 U本位 / 币本位
 # ==========================================
-# routers/contracts.py（完全动态版，支持 109 个 ccxt.pro 交易所）
 
-# 保底主流 U 本位永续合约（客户端不传 symbols 时使用）
-DEFAULT_SYMBOLS = [
+# 保底主流合约（区分 U本位 / 币本位）
+DEFAULT_SYMBOLS_LINEAR = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"
 ]
 
-# 少数需要特殊 load_markets 参数的交易所（其他默认就行）
-SPECIAL_LOAD_PARAMS = {
-    "bybit": {"category": "linear"},
-    "okx": {"instType": "SWAP"},
-    "bingx": {"category": "perpetual"},
-    "bitget": {},
-    "gate": {"type": "swap"},
-    "mexc": {"type": "swap"},
-}
+DEFAULT_SYMBOLS_INVERSE = [
+    "BTC/USD:BTC", "ETH/USD:BTC", "SOL/USD:BTC", "XRP/USD:BTC", "DOGE/USD:BTC"
+]  # Binance/Bybit常见inverse格式，客户端可覆盖
 
 @router.websocket("/ws/contracts")
 async def ws_dynamic_contracts(
     websocket: WebSocket,
-    exchange: str = Query(..., description="任意 ccxt.pro 支持的小写交易所名，如 bybit、okx、gate、mexc..."),
-    symbols: str = Query(None, description="可选，逗号分隔的 symbol 列表，如 BTCUSDT,ETHUSDT（不传用保底）")
+    exchange: str = Query(..., description="任意ccxt.pro支持的小写交易所名，如 bybit、okx、gate、mexc..."),
+    type: str = Query("linear", description="linear (U本位) | inverse (币本位)"),
+    symbols: str = Query(None, description="可选，逗号分隔的symbol列表，如 BTCUSDT,ETHUSDT（不传用保底）")
 ):
     await websocket.accept()
     alive = asyncio.Event()
     alive.set()
-    logger.info(f"WS 连接成功，交易所: {exchange}")
+    logger.info(f"WS连接成功，交易所: {exchange}，类型: {type}")
 
-    # 动态创建 ccxt.pro 实例（支持全部 109 个）
+    # 动态创建实例
     try:
         config = {
-            "options": {"defaultType": "swap"},  # 默认 U 本位永续
+            "options": {"defaultType": "swap" if type == "linear" else "inverse"},
             "enableRateLimit": True,
         }
         exchange_class = getattr(ccxt_pro, exchange)
         ex = exchange_class(config)
     except AttributeError:
-        await websocket.send_json({"error": f"ccxt.pro 不支持该交易所: {exchange}（请检查拼写，小写）"})
+        await websocket.send_json({"error": f"ccxt.pro不支持该交易所: {exchange}"})
         await websocket.close(code=1000)
         return
     except Exception as e:
@@ -151,21 +157,21 @@ async def ws_dynamic_contracts(
 
     tasks = []
     try:
-        # 尝试加载市场（特殊交易所用 params）
+        # 尝试加载市场
         try:
             params = SPECIAL_LOAD_PARAMS.get(exchange, {})
             await ex.load_markets(params=params)
-            logger.info(f"{exchange} markets 加载成功")
+            logger.info(f"{exchange} markets加载成功")
         except Exception as e:
-            logger.warning(f"{exchange} markets 加载失败: {e}")
+            logger.warning(f"{exchange} markets加载失败: {e}")
 
-        # symbol 来源：客户端传 > 保底
+        # symbol来源：客户端传 > 保底（区分类型）
         if symbols:
             target_symbols = [s.strip() for s in symbols.split(",")][:10]  # 最多 10 个，防滥用
         else:
-            target_symbols = DEFAULT_SYMBOLS[:5]
+            target_symbols = DEFAULT_SYMBOLS_LINEAR if type == "linear" else DEFAULT_SYMBOLS_INVERSE
 
-        logger.info(f"{exchange} 开始推送 {len(target_symbols)} 个合约: {target_symbols}")
+        logger.info(f"{exchange} {type} 开始推送 {len(target_symbols)} 个合约: {target_symbols}")
 
         for symbol in target_symbols:
             tasks.append(asyncio.create_task(ticker_task(ex, symbol, websocket, exchange, alive)))
@@ -173,19 +179,19 @@ async def ws_dynamic_contracts(
         await asyncio.gather(*tasks, return_exceptions=True)
 
     except WebSocketDisconnect:
-        logger.info("WS 客户端正常断开")
+        logger.info("WS客户端正常断开")
     except Exception as e:
-        logger.error(f"WS 异常: {e}")
+        logger.error(f"WS异常: {e}")
     finally:
         alive.clear()
-        await asyncio.sleep(0.1)  # 给任务响应取消
+        await asyncio.sleep(0.1)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await ex.close()
-        logger.info("WS 资源已清理")
+        logger.info("WS资源已清理")
 
-# ticker 任务（手动提取字段 + 关闭检测 + 无效价格过滤）
+# ticker任务（保持你原有异常处理风格，只加关闭检测）
 async def ticker_task(
     ex: ccxt_pro.Exchange,
     symbol: str,
@@ -197,9 +203,8 @@ async def ticker_task(
         try:
             ticker = await ex.watch_ticker(symbol)
 
-            # 检测 WS 是否已关闭
             if not alive.is_set() or ws.client_state.name != "CONNECTED":
-                logger.debug(f"{ex_name} {symbol} WS 已关闭，停止 ticker 任务")
+                logger.debug(f"{ex_name} {symbol} WS已关闭，停止任务")
                 break
 
             data = {
@@ -212,9 +217,8 @@ async def ticker_task(
                 "timestamp": ticker.get("timestamp") or ticker.get("ts"),
             }
 
-            # 过滤无效价格，不发垃圾数据
             if data["last"] is None or data["last"] <= 0:
-                logger.warning(f"{ex_name} {symbol} 无效价格，跳过发送")
+                logger.warning(f"{ex_name} {symbol} 无效价格，跳过")
                 await asyncio.sleep(5)
                 continue
 
@@ -223,8 +227,6 @@ async def ticker_task(
         except ccxt.BadSymbol as e:
             # ❌ 不支持的 symbol —— 不可恢复
             logger.warning(f"{ex_name} {symbol} 不存在: {e}")
-
-            # 通知 client（只发一次）
             if ws.client_state.name == "CONNECTED":
                 await ws.send_json({
                     "type": "error",
