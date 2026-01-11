@@ -24,7 +24,6 @@ def get_sync_exchange_instance(
     key = f"{exchange_name}_{contract_type}"
     if key in SYNC_INSTANCE_CACHE:
         return SYNC_INSTANCE_CACHE[key]
-
     config = {}  # 故意为空，依赖全局补丁注入代理/timeout/limit
 
     # 特殊处理需要自定义urls或options的交易所
@@ -37,14 +36,11 @@ def get_sync_exchange_instance(
             }
         }
         config["options"] = {"defaultType": "future" if contract_type == "linear" else "delivery"}
-
     elif exchange_name in ["bybit", "bitget"]:
         config["options"] = {"defaultType": "swap" if contract_type == "linear" else "inverse"}
-
     elif exchange_name in ["okx", "gate", "mexc", "kucoin", "huobi", "htx"]:
         # 大多数亚洲CEX默认就是swap/linear/inverse，无需额外配置
         config["options"] = {"defaultType": "swap" if contract_type == "linear" else "inverse"}
-
     else:
         # 其他交易所直接用默认配置（ccxt会自动处理）
         config["options"] = {"defaultType": "swap" if contract_type == "linear" else "inverse"}
@@ -59,14 +55,12 @@ def get_sync_exchange_instance(
     SYNC_INSTANCE_CACHE[key] = ex
     return ex
 
-
 # 某些交易所 load_markets 需要额外参数，否则 WS 会歧义 / 报错
 SPECIAL_LOAD_PARAMS = {
     # OKX：必须指定 marketType，否则 BTC-USDT-SWAP 会歧义
     "okx": {
         "type": "swap",
     },
-
     # 如果以后发现其他交易所有类似问题，再加
     # "bybit": {...},
     # "gate": {...},
@@ -74,19 +68,18 @@ SPECIAL_LOAD_PARAMS = {
 
 @router.get("/contracts/markets")
 def get_contracts_markets(
-    exchange: str = Query("binance", description="交易所: binance | okx | bybit | gate | mexc..."),
-    type: str = Query("linear", description="linear (U本位) | inverse (币本位)")
+    exchange: str = Query("okx"),
+    type: str = Query("linear"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=10, le=100),
+    sort: str = Query("symbol"),
+    order: str = Query("asc")
 ):
-    """
-    客户端可传参数控制返回哪家交易所的哪类合约
-    示例：
-    /api/contracts/markets?exchange=binance&type=linear → Binance U本位
-    /api/contracts/markets?exchange=binance&type=inverse → Binance 币本位
-    /api/contracts/markets?exchange=okx&type=linear → OKX U本位
-    """
     ex = get_sync_exchange_instance(exchange, type)
     try:
-        ex.load_markets()
+        ex.load_markets(params=SPECIAL_LOAD_PARAMS.get(exchange, {}))
+
+        # 1. 构建完整交易对列表
         contracts = [m for m in ex.markets.values() if m.get("swap") and m.get("contract")]
         result = [
             {
@@ -96,21 +89,60 @@ def get_contracts_markets(
                 "linear": m.get("linear", False),
                 "inverse": m.get("inverse", False),
                 "max_leverage": m.get("limits", {}).get("leverage", {}).get("max"),
+                "min_leverage": m.get("limits", {}).get("leverage", {}).get("min"),
                 "exchange": exchange,
+                # 预留资金费率字段
+                "funding_rate": -0,
+                "next_funding_time": -0,
             }
             for m in contracts
         ]
-        # 客户端指定类型过滤（保持你原有逻辑）
+        logger.info('🍌 market info: %s', contracts[0])
+
+        # 类型过滤 + 排序 + 分页（你原有逻辑）
         if type == "linear":
             result = [r for r in result if r["linear"]]
         elif type == "inverse":
             result = [r for r in result if r["inverse"]]
+        
+        # 排序字段校验
+        allowed_sort = ["symbol", "volume_24h", "price_change", "leverage", "funding_rate"]
+        sort = sort if sort in allowed_sort else "symbol"
+        reverse = order.lower() == "desc"
+        
+        result.sort(key=lambda x: x.get(sort, 0) if sort != "symbol" else x["symbol"], reverse=reverse)
 
-        result.sort(key=lambda x: x["symbol"])
-        logger.info(f"返回 {exchange} {type} 合约 {len(result)} 个")
-        return {"data": result}
+        start = (page - 1) * limit
+        paginated = result[start:start + limit]
+
+        # 2. 批量拉取资金费率（只对当前页的 symbol 拉取，节省请求）
+        symbols = [r["symbol"] for r in paginated]
+        if symbols:
+            try:
+                funding_data = ex.fetch_funding_rates(symbols)  # 批量获取
+                logger.info('🍎 funding_data: %s', funding_data)
+                for r in paginated:
+                    funding = funding_data.get(r["symbol"], {})
+                    r["funding_rate"] = funding.get("fundingRate", -0)
+                    r["next_funding_time"] = funding.get("nextFundingTime", -0) or funding.get("fundingTimestamp", -0)
+                logger.info(f"成功拉取 {len(symbols)} 个合约的资金费率")
+            except Exception as e:
+                logger.warning(f"拉取资金费率失败: {e}，字段保持 None")
+
+        return {
+            "data": paginated,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": len(result),
+                "total_pages": (len(result) + limit - 1) // limit,
+                "sort": sort,
+                "order": order
+            }
+        }
+
     except Exception as e:
-        logger.error(f"加载 {exchange} {type} 合约失败: {e}")
+        logger.error(f"接口异常: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
@@ -202,6 +234,7 @@ async def ticker_task(
     while alive.is_set():
         try:
             ticker = await ex.watch_ticker(symbol)
+            logger.info('🌹 ticker info: %s', ticker)
 
             if not alive.is_set() or ws.client_state.name != "CONNECTED":
                 logger.debug(f"{ex_name} {symbol} WS已关闭，停止任务")
@@ -215,6 +248,10 @@ async def ticker_task(
                 "change": ticker.get("percentage") or ticker.get("price24hPcnt") or ticker.get("priceChangePercent"),
                 "volume_24h": ticker.get("baseVolume") or ticker.get("volume24h"),
                 "timestamp": ticker.get("timestamp") or ticker.get("ts"),
+                "funding_rate": ticker.get("fundingRate") or ticker.get("funding_rate") 
+                or ticker.get("info", {}).get("fundingRate") or -0,
+                "next_funding_time": ticker.get("nextFundingTime") or ticker.get("fundingTime") 
+                or ticker.get("info", {}).get("nextFundingTime") or -0,
             }
 
             if data["last"] is None or data["last"] <= 0:
