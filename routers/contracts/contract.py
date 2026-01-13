@@ -88,12 +88,12 @@ def get_contracts_markets(
                 "quote": m["quote"],
                 "linear": m.get("linear", False),
                 "inverse": m.get("inverse", False),
-                "max_leverage": m.get("limits", {}).get("leverage", {}).get("max"),
-                "min_leverage": m.get("limits", {}).get("leverage", {}).get("min"),
+                "maxLeverage": m.get("limits", {}).get("leverage", {}).get("max"),
+                "minLeverage": m.get("limits", {}).get("leverage", {}).get("min"),
                 "exchange": exchange,
                 # 预留资金费率字段
-                "funding_rate": -0,
-                "next_funding_time": -0,
+                "fundingRate": -0,
+                "nextFundingTime": -0,
             }
             for m in contracts
         ]
@@ -106,7 +106,7 @@ def get_contracts_markets(
             result = [r for r in result if r["inverse"]]
         
         # 排序字段校验
-        allowed_sort = ["symbol", "volume_24h", "price_change", "leverage", "funding_rate"]
+        allowed_sort = ["symbol", "volume_24h", "priceChange", "leverage", "fundingRate"]
         sort = sort if sort in allowed_sort else "symbol"
         reverse = order.lower() == "desc"
         
@@ -120,11 +120,11 @@ def get_contracts_markets(
         if symbols:
             try:
                 funding_data = ex.fetch_funding_rates(symbols)  # 批量获取
-                logger.info('🍎 funding_data: %s', funding_data)
+                # logger.info('🍎 funding_data: %s', funding_data)
                 for r in paginated:
                     funding = funding_data.get(r["symbol"], {})
-                    r["funding_rate"] = funding.get("fundingRate", -0)
-                    r["next_funding_time"] = funding.get("nextFundingTime", -0) or funding.get("fundingTimestamp", -0)
+                    r["fundingRate"] = funding.get("fundingRate", -0)
+                    r["nextFundingTime"] = funding.get("nextFundingTime", -0) or funding.get("fundingTimestamp", -0)
                 logger.info(f"成功拉取 {len(symbols)} 个合约的资金费率")
             except Exception as e:
                 logger.warning(f"拉取资金费率失败: {e}，字段保持 None")
@@ -174,7 +174,6 @@ async def ws_dynamic_contracts(
     try:
         config = {
             "options": {"defaultType": "swap" if type == "linear" else "inverse"},
-            "enableRateLimit": True,
         }
         exchange_class = getattr(ccxt_pro, exchange)
         ex = exchange_class(config)
@@ -248,9 +247,9 @@ async def ticker_task(
                 "change": ticker.get("percentage") or ticker.get("price24hPcnt") or ticker.get("priceChangePercent"),
                 "volume_24h": ticker.get("baseVolume") or ticker.get("volume24h"),
                 "timestamp": ticker.get("timestamp") or ticker.get("ts"),
-                "funding_rate": ticker.get("fundingRate") or ticker.get("funding_rate") 
+                "fundingRate": ticker.get("fundingRate") or ticker.get("funding_rate") 
                 or ticker.get("info", {}).get("fundingRate") or -0,
-                "next_funding_time": ticker.get("nextFundingTime") or ticker.get("fundingTime") 
+                "nextFundingTime": ticker.get("nextFundingTime") or ticker.get("fundingTime") 
                 or ticker.get("info", {}).get("nextFundingTime") or -0,
             }
 
