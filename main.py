@@ -12,6 +12,8 @@ from routers import ohlc
 from routers import order_book
 from routers import trades
 from routers import ws_ticker
+from routers import ws_orderbook
+
 from utils.logger import setup_logging
 from routers.contracts import contract
 
@@ -60,3 +62,10 @@ app.include_router(contract.router, prefix="/api")
 @app.websocket("/api/ws/ticker")
 async def ticker_ws(websocket: WebSocket, exchange: str = Query("binance")):
     await ws_ticker.websocket_ticker(websocket, exchange)  # 调用分离的逻辑
+
+@app.websocket("/api/ws/orderbook")
+async def orderbook_ws(
+    websocket: WebSocket,
+    exchange: str = Query("binance"),
+):
+    await ws_orderbook.websocket_orderbook(websocket, exchange)
