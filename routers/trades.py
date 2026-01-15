@@ -1,5 +1,9 @@
 from fastapi import APIRouter, Query
 import ccxt
+import logging
+from datetime import datetime  # 用于 fallback ts
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()  # 创建路由器
 
@@ -24,34 +28,70 @@ async def get_trades(
 ):
     """
     完全兼容旧 CryptoWatch 的 /markets/{exchange}/{pair}/trades 接口
-    返回 {"result": [[id, timestamp, price, amount], ...]}
+    返回统一结构：{"code": 0, "msg": "success", "data": {"result": [[...], ...]}, "ts": ...}
     """
     try:
         exchange = exchange.lower().strip()
-
         ex_class = getattr(ccxt, exchange)
-        ex = ex_class()
+        ex = ex_class({'enableRateLimit': True})  # 建议加限速，避免被 ban
 
         trades = ex.fetch_trades(symbol, limit=limit)
 
-        # 构造 CryptoWatch 风格的 result 数组
-        # [id, timestamp, price, amount] 全转字符串（兼容你的 Trade.fromJson(List<dynamic>))
+        # 构造 CryptoWatch 风格的 result 数组（核心逻辑不变）
+        # [id, timestamp, price, amount, side] 全转字符串（兼容你的 Trade.fromJson(List<dynamic>))
         result = [
             [
-                str(trade["id"]) if trade["id"] is not None else "",  # id
-                str(trade["timestamp"]),  # timestamp (ms)
-                str(trade["price"]),  # price
-                str(trade["amount"]),  # amount
+                str(trade["id"]) if trade["id"] is not None else "",
+                str(trade["timestamp"]),
+                str(trade["price"]),
+                str(trade["amount"]),
                 str(trade["side"]),  # buy or sell
             ]
             for trade in trades
         ]
 
-        return {"result": result}
+        logger.info("🌈 trades query params: %s %s %s (fetched %d trades)", exchange, symbol, limit, len(trades))
+
+        # 统一返回结构
+        return {
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "result": result,
+                "symbol": symbol,  # 可选加回，便于客户端确认
+            },
+            "ts": int(ex.milliseconds())
+        }
 
     except AttributeError:
-        return {"error": f"不支持的交易所: '{exchange}'"}
+        return {
+            "code": 4001,
+            "msg": f"不支持的交易所: '{exchange}'",
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000)
+        }
+
     except ccxt.BadSymbol:
-        return {"error": f"无效的交易对: '{symbol}' 在 {exchange} 不存在"}
+        return {
+            "code": 4002,
+            "msg": f"无效的交易对: '{symbol}' 在 {exchange} 不存在",
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000)
+        }
+
+    except ccxt.NetworkError as e:
+        return {
+            "code": 5001,
+            "msg": f"网络错误: {str(e)}",
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000)
+        }
+
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"trades REST 异常: {str(e)}")
+        return {
+            "code": 5000,
+            "msg": str(e),
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000)
+        }

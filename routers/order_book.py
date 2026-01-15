@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query
 import ccxt
 import logging
+from datetime import datetime  # 用于 fallback ts
 
 logger = logging.getLogger(__name__)
 
@@ -27,33 +28,68 @@ async def get_order_book(
 ):
     try:
         exchange = exchange.lower().strip()
-
         ex_class = getattr(ccxt, exchange)
-        ex = ex_class()
+        ex = ex_class({"enableRateLimit": True})  # 建议加限速，避免被 ban
 
         orderbook = ex.fetch_order_book(symbol, limit=limit)
+
         logger.info("🌈 orderbook query params: %s %s %s", exchange, symbol, limit)
 
-        # 构造兼容旧模型的 result
-        result = {
+        # 构造兼容旧模型的 data（核心数据部分不变）
+        data = {
             "asks": [
                 [float(price), float(amount)] for price, amount in orderbook["asks"]
             ],
             "bids": [
                 [float(price), float(amount)] for price, amount in orderbook["bids"]
             ],
-            "seqNum": orderbook.get("nonce")
+            "nonce": orderbook.get("nonce")
             or orderbook.get("sequence")
             or 0,  # 兼容不同交易所
-            "timestamp": orderbook.get("timestamp") or int(ex.milliseconds()),  #
+            "timestamp": orderbook.get("timestamp") or int(ex.milliseconds()),
             "symbol": orderbook.get("symbol") or symbol,
+            "exchange": exchange,
+            "action": "fetch",
+            "marketType": "",
         }
 
-        return {"result": result}
+        # 统一返回结构
+        return {
+            "code": 0,
+            "msg": "success",
+            "data": data,
+            "ts": int(ex.milliseconds()),  # 或用 datetime.utcnow().timestamp() * 1000
+        }
 
     except AttributeError:
-        return {"error": f"不支持的交易所: '{exchange}'"}
+        return {
+            "code": 4001,
+            "msg": f"不支持的交易所: '{exchange}'",
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000),
+        }
+
     except ccxt.BadSymbol:
-        return {"error": f"无效的交易对: '{symbol}' 在 {exchange} 不存在"}
+        return {
+            "code": 4002,
+            "msg": f"无效的交易对: '{symbol}' 在 {exchange} 不存在",
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000),
+        }
+
+    except ccxt.NetworkError as e:
+        return {
+            "code": 5001,
+            "msg": f"网络错误: {str(e)}",
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000),
+        }
+
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"orderbook REST 异常: {str(e)}")
+        return {
+            "code": 5000,
+            "msg": str(e),
+            "data": None,
+            "ts": int(datetime.utcnow().timestamp() * 1000),
+        }

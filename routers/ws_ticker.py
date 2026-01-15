@@ -4,9 +4,7 @@ import logging
 import ccxt.pro as ccxt_pro
 from fastapi import WebSocket, WebSocketDisconnect, Query
 from typing import Dict, Any
-
 logger = logging.getLogger(__name__)
-
 def to_float(v):
     if v is None:
         return None
@@ -18,7 +16,6 @@ def to_float(v):
         except ValueError:
             return None
     return None
-
 def to_int(v):
     if v is None:
         return None
@@ -32,10 +29,8 @@ def to_int(v):
         except ValueError:
             return None
     return None
-
 # 全局交易所缓存 (ccxt.pro 实例)
 exchanges: Dict[str, ccxt_pro.Exchange] = {}
-
 async def get_exchange_pro(exchange_name: str) -> ccxt_pro.Exchange:
     exchange_name = exchange_name.lower().strip()
     if exchange_name not in exchanges:
@@ -45,7 +40,6 @@ async def get_exchange_pro(exchange_name: str) -> ccxt_pro.Exchange:
         # 实例化时补丁会自动注入代理和 defaultType
         exchanges[exchange_name] = ex_class()
     return exchanges[exchange_name]
-
 def has_meaningful_change(old: Dict, new: Dict, price_threshold: float = 1e-8, pct_threshold: float = 0.01) -> bool:
     """对比价格和涨跌幅是否有意义的变动"""
     old_last = old.get("last")
@@ -53,15 +47,12 @@ def has_meaningful_change(old: Dict, new: Dict, price_threshold: float = 1e-8, p
     if old_last and new_last and old_last != 0:
         if abs(new_last - old_last) / abs(old_last) > price_threshold:
             return True
-    
     old_pct = old.get("percentage")
     new_pct = new.get("percentage")
     if old_pct is not None and new_pct is not None:
         if abs(new_pct - old_pct) > pct_threshold:
             return True
-    
     return False
-
 async def watch_ticker_task(
     exchange: ccxt_pro.Exchange,
     symbol: str,
@@ -71,12 +62,11 @@ async def watch_ticker_task(
     """真正的 WebSocket 推送任务，支持多市场类型，带首次推送和 Diff 过滤"""
     logger.info(f"🚀 开始监听 {symbol} ({market_type}) WebSocket...")
     last_sent_data = None
-    
     try:
         while True:
             # 1. 等待交易所真实推送（ccxt.pro watch_ticker 是异步阻塞式）
             ticker_raw = await exchange.watch_ticker(symbol)
-            
+            info = ticker_raw.get("info", {})
             # 2. 统一构建推送数据结构（兼容你的 freezed TickerModel）
             current_payload: Dict[str, Any] = {
                 "symbol": symbol,
@@ -93,29 +83,28 @@ async def watch_ticker_task(
                 "quoteVolume": ticker_raw.get("quoteVolume") or 0.0,
                 "timestamp": ticker_raw.get("timestamp") or int(asyncio.get_event_loop().time() * 1000),
                 "vwap": ticker_raw.get("vwap"),
-                "info": ticker_raw.get("info", {}),
+                "info": info,
             }
-            
             # 补充市场类型专有字段
             if market_type in ["perpetual", "delivery", "swap", "future"]:
+                
                 current_payload.update({
                     "markPrice": to_float(
-                        ticker_raw.get("markPrice") or ticker_raw.get("info", {}).get("markPrice")
+                        ticker_raw.get("markPrice") or info.get("markPrice") or info.get("mark_price")
                     ),
                     "indexPrice": to_float(
-                        ticker_raw.get("indexPrice") or ticker_raw.get("info", {}).get("indexPrice")
+                        ticker_raw.get("indexPrice") or info.get("indexPrice") or info.get("index_price")
                     ),
                     "fundingRate": to_float(
-                        ticker_raw.get("fundingRate") or ticker_raw.get("info", {}).get("fundingRate")
+                        ticker_raw.get("fundingRate") or info.get("fundingRate") or info.get("funding_rate")
                     ),
                     "nextFundingTime": to_int(
-                        ticker_raw.get("nextFundingTime") or ticker_raw.get("info", {}).get("nextFundingTime")
+                        ticker_raw.get("nextFundingTime") or info.get("nextFundingTime") or info.get("next_funding_time")
                     ),
                     "openInterest": to_float(
-                        ticker_raw.get("openInterest") or ticker_raw.get("info", {}).get("openInterest")
+                        ticker_raw.get("openInterest") or info.get("openInterest") or info.get("open_interest")
                     ),
                 })
-            
             elif market_type == "option":
                 current_payload.update({
                     "strikePrice": ticker_raw.get("strike"),
@@ -124,7 +113,6 @@ async def watch_ticker_task(
                     "impliedVolatility": ticker_raw.get("impliedVolatility"),
                     "underlyingPrice": ticker_raw.get("underlyingPrice"),
                 })
-            
             # 3. Diff 检查：首次强制推送，否则只推送有意义变化
             should_send = False
             if last_sent_data is None:
@@ -140,38 +128,34 @@ async def watch_ticker_task(
                 }
                 if has_meaningful_change(old_comp, new_comp):
                     should_send = True
-            
             # 4. 推送
             if should_send:
                 await websocket.send_text(json.dumps({
-                    "type": "ticker",
-                    "data": current_payload
+                    "code": 0,
+                    "msg": "success",
+                    "data": current_payload,
+                    "ts": exchange.milliseconds(),
+                    "type": "ticker"
                 }, ensure_ascii=False))
-                
                 last_sent_data = current_payload.copy()
                 logger.pretty(f"📤 {symbol} ({market_type}) 更新推送: {current_payload }")
             # else:
-            #     logger.debug(f"⏳ {symbol} 变化太小，跳过推送")
-                
+            # logger.debug(f"⏳ {symbol} 变化太小，跳过推送")
     except asyncio.CancelledError:
         logger.info(f"🛑 {symbol} ({market_type}) 监听任务已取消")
     except Exception as e:
         logger.error(f"⚠️ {symbol} ({market_type}) 监听异常: {e}")
-        await asyncio.sleep(5)  # 重试间隔
-
+        await asyncio.sleep(5) # 重试间隔
 async def websocket_ticker(
     websocket: WebSocket,
     exchange: str = "binance"
 ):
     await websocket.accept()
     logger.info(f"New WS connection: {exchange}")
-    
     try:
         ex = await get_exchange_pro(exchange)
-        
         # 该连接下的所有监听任务 {symbol: task}
         active_tasks: Dict[str, asyncio.Task] = {}
-        
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
@@ -184,7 +168,6 @@ async def websocket_ticker(
                 # perpetual / swap / future / option 等
                 # ex = await get_exchange_pro(f"{exchange}_{market_type}")
                 ex.options["defaultType"] = market_type
-
             if action == "subscribe" and symbol:
                 if symbol not in active_tasks:
                     task = asyncio.create_task(
@@ -193,42 +176,53 @@ async def websocket_ticker(
                     active_tasks[symbol] = task
                     logger.info(f"✅ Subscribed: {symbol} ({market_type})")
                     await websocket.send_text(json.dumps({
-                        "action": "subscribed",
-                        "symbol": symbol,
-                        "marketType": market_type
-                    }))
-            
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "action": "subscribed",
+                            "symbol": symbol,
+                            "marketType": market_type
+                        },
+                        "ts": ex.milliseconds(),
+                    }, ensure_ascii=False))
             elif action == "unsubscribe" and symbol:
                 task = active_tasks.pop(symbol, None)
                 if task:
                     task.cancel()
                     logger.info(f"❌ Unsubscribed: {symbol} ({market_type})")
                     await websocket.send_text(json.dumps({
-                        "action": "unsubscribed",
-                        "symbol": symbol,
-                        "marketType": market_type
-                    }))
-            
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "action": "unsubscribed",
+                            "symbol": symbol,
+                            "marketType": market_type
+                        },
+                        "ts": ex.milliseconds(),
+                    }, ensure_ascii=False))
             elif action == "ping":
-                await websocket.send_text(json.dumps({"action": "pong"}))
-    
+                await websocket.send_text(json.dumps({
+                    "code": 0,
+                    "msg": "success",
+                    "data": {"action": "pong"},
+                    "ts": ex.milliseconds()
+                }, ensure_ascii=False))
     except WebSocketDisconnect:
         logger.info("WS connection closed by client")
-    
     except Exception as e:
         logger.error(f"WS 全局异常: {e}")
-        await websocket.send_text(json.dumps({"error": str(e)}))
-    
+        await websocket.send_text(json.dumps({
+            "code": 5000,
+            "msg": str(e),
+            "data": None,
+            "ts": ex.milliseconds() if 'ex' in locals() else int(asyncio.get_event_loop().time() * 1000)
+        }, ensure_ascii=False))
     finally:
         # 清理所有任务
         for task in active_tasks.values():
             task.cancel()
         active_tasks.clear()
         logger.info(f"Cleaned up {len(active_tasks)} tasks for closed connection")
-
-
-
-
 # 并发多个监听
 async def watch_ticker_task_pro(
     exchange: ccxt_pro.Exchange,
@@ -239,22 +233,18 @@ async def watch_ticker_task_pro(
     """真正的 WebSocket 推送任务，同时监听 ticker + markPrice（合约专用）"""
     logger.info(f"🚀 开始监听 {symbol} ({market_type}) WebSocket...")
     last_sent_data = None
-
     # 合约类型才监听 markPrice（包含 fundingRate）
     is_contract = market_type in ["perpetual", "delivery", "swap", "future"]
-
     async def ticker_loop():
         while True:
             ticker = await exchange.watch_ticker(symbol)
-            return {"type": "ticker", "data": ticker}  # 只返回一次用于初始化
-
+            return {"type": "ticker", "data": ticker} # 只返回一次用于初始化
     async def mark_price_loop():
         if not is_contract:
             return None
         while True:
             mark = await exchange.watch_mark_price(symbol)
             return {"type": "mark_price", "data": mark}
-
     # 合并两个 loop 的结果（用 asyncio.gather 并发等待）
     try:
         while True:
@@ -263,7 +253,6 @@ async def watch_ticker_task_pro(
                 [ticker_loop(), mark_price_loop()] if is_contract else [ticker_loop()],
                 return_when=asyncio.FIRST_COMPLETED
             )
-
             for task in done:
                 result = task.result()
                 if result:
@@ -285,17 +274,15 @@ async def watch_ticker_task_pro(
                         "vwap": result["data"].get("vwap"),
                         "info": result["data"].get("info", {}),
                     }
-
                     # 总是从 mark_price 补充（如果有）
                     if is_contract and result["type"] == "mark_price":
                         current_payload.update({
                             "markPrice": result["data"].get("markPrice"),
                             "indexPrice": result["data"].get("indexPrice"),
-                            "fundingRate": result["data"].get("fundingRate"),  # ← 这里就是资金费率！
+                            "fundingRate": result["data"].get("fundingRate"), # ← 这里就是资金费率！
                             "nextFundingTime": result["data"].get("nextFundingTime"),
                             "openInterest": result["data"].get("openInterest"),
                         })
-
                     # Diff 检查 + 推送（逻辑不变）
                     should_send = False
                     if last_sent_data is None:
@@ -311,21 +298,19 @@ async def watch_ticker_task_pro(
                             "percentage": current_payload.get("percentage"),
                             "fundingRate": current_payload.get("fundingRate"),
                         }
-                        if has_meaningful_change(old_comp, new_comp, pct_threshold=0.0005):  # fundingRate 阈值可调小
+                        if has_meaningful_change(old_comp, new_comp, pct_threshold=0.0005): # fundingRate 阈值可调小
                             should_send = True
-
                     if should_send:
                         await websocket.send_text(json.dumps({
-                            "type": "ticker_update",
+                            "code": 0,
+                            "msg": "success",
                             "data": current_payload
                         }, ensure_ascii=False))
                         last_sent_data = current_payload.copy()
-                        logger.info(f"📤 {symbol} ({market_type}) 更新推送: last={current_payload.get('last')}, fundingRate={current_payload.get('fundingRate')}")
-
+                        # logger.info(f"📤 {symbol} ({market_type}) 更新推送: last={current_payload.get('last')}, fundingRate={current_payload.get('fundingRate')}")
                     # 取消已完成的 pending task，避免内存泄漏
                     for p in pending:
                         p.cancel()
-
     except asyncio.CancelledError:
         logger.info(f"🛑 {symbol} ({market_type}) 监听任务已取消")
     except Exception as e:
